@@ -1,0 +1,81 @@
+# Define build arguments
+ARG ALPINE_VERSION=3.21
+ARG GO_VERSION=1.25.0
+
+# Stage 1: Build ffprobe (using a specific version)
+FROM alpine:${ALPINE_VERSION} AS ffprobe-builder
+
+# Define the FFmpeg version
+ARG FFMPEG_VERSION=7.1
+
+# Install dependencies
+RUN apk add --no-cache build-base yasm pkgconfig openssl-dev curl
+
+WORKDIR /usr/src/ffmpeg
+
+# Download and extract FFmpeg source
+# RUN wget http://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.bz2 && \
+#     tar -xf ffmpeg-$FFMPEG_VERSION.tar.bz2
+RUN curl -L -o ffmpeg-$FFMPEG_VERSION.tar.gz http://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.gz && \
+    tar -xzf ffmpeg-$FFMPEG_VERSION.tar.gz
+
+# Go into the extracted directory
+WORKDIR /usr/src/ffmpeg/ffmpeg-$FFMPEG_VERSION
+
+# Configure and build ffprobe only
+RUN ./configure \
+    --disable-ffplay \
+    --disable-ffmpeg \
+    --disable-doc \
+    --disable-muxers \
+    --disable-swscale \
+    --disable-avfilter \
+    --disable-avdevice \
+    --disable-postproc \
+    --disable-debug \
+    --disable-bsfs \
+    --disable-parsers \
+    --disable-demuxers \
+    --enable-demuxer=flv,mov,mp4,m4a,3gp,3g2,mj2,mpegts,mpegvideo,matroska,ogg,avi \
+    --enable-parser=h264,hevc,aac,mpeg4video,mpegaudio \
+    --enable-protocol=https \
+    --enable-openssl \
+    --enable-gpl \
+    --enable-small \
+    --enable-version3 \
+    --enable-nonfree \
+    --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install
+
+# Stage 2: Build Go probe (unchanged)
+FROM golang:${GO_VERSION}-alpine AS go-builder
+
+WORKDIR /app
+COPY . .
+
+RUN go mod download
+RUN go mod verify
+
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /ffprobe-cli cmd/api/main.go
+
+# Stage 3: Final container with tools available
+FROM alpine:${ALPINE_VERSION}
+
+# Copy ffprobe
+COPY --from=ffprobe-builder /usr/local/bin/ffprobe /usr/local/bin/
+
+# Copy Go probe
+COPY --from=go-builder /ffprobe-cli /usr/local/bin/
+
+EXPOSE 8080
+
+# Set the entrypoint
+ENTRYPOINT ["ffprobe-cli"]
+
+# To build multi-arch image, use the following command:
+# docker buildx build --platform linux/arm64,linux/amd64 -t commands/ffprobe:latest \
+#   --build-arg ALPINE_VERSION=3.21 \
+#   --build-arg GO_VERSION=1.25.0 \
+#   --build-arg FFMPEG_VERSION=7.1 \
+#   .
