@@ -104,7 +104,8 @@ func (m *Manager) execute(id string) {
 	m.notify(ctx, *job)
 	JobsInProgress.Inc()
 
-	if err := m.runner.Run(ctx, job.ID, job.Command, job.Args, job.WorkingDir); err != nil {
+	result, err := m.runner.Run(ctx, job.ID, job.Command, job.Args, job.WorkingDir)
+	if err != nil {
 		job.Status = JobStatusFailed
 		job.Error = err.Error()
 		_ = m.store.Update(job)
@@ -113,6 +114,20 @@ func (m *Manager) execute(id string) {
 		JobsFailedTotal.Inc()
 		return
 	}
+
+	// Update job with results
+	job.ExitCode = &result.ExitCode
+	job.Stdout = &result.Stdout
+	job.Stderr = &result.Stderr
+
+	slog.Info("job execution completed",
+		"job_id", job.ID,
+		"exit_code", result.ExitCode,
+		"stdout", result.Stdout,
+		"stderr", result.Stderr,
+		"duration", result.Duration.String(),
+		"error", result.Error,
+	)
 
 	done := time.Now().UTC()
 	job.Status = JobStatusCompleted
@@ -129,6 +144,7 @@ func (m *Manager) notify(ctx context.Context, job Job) {
 	}
 	_ = m.sender.Notify(ctx, job.WebhookURL, webhook.Event{
 		JobID:     job.ID,
+		Data:      job,
 		Status:    string(job.Status),
 		Error:     job.Error,
 		Timestamp: time.Now().UTC(),
