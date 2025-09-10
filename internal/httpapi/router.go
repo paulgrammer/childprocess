@@ -6,21 +6,33 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/paulgrammer/childprocess/internal/jobs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-type router struct {
-	manager *jobs.Manager
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins
+	},
 }
 
-func NewRouter(manager *jobs.Manager) http.Handler {
-	r := &router{manager: manager}
+type router struct {
+	manager  *jobs.Manager
+	streamer *jobs.LogStreamer
+}
+
+func NewRouter(manager *jobs.Manager, streamer *jobs.LogStreamer) http.Handler {
+	r := &router{manager: manager, streamer: streamer}
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", r.handleHealth)
 	m.HandleFunc("POST /jobs", r.handleJobs)
 	m.HandleFunc("GET /jobs/{id}", r.handleJob)
+	m.HandleFunc("GET /jobs/{id}/logs", r.handleJobLogs)
 	m.Handle("GET /metrics", promhttp.Handler())
+	m.Handle("/", http.FileServer(http.Dir("./frontend")))
 	return logging(m)
 }
 
@@ -72,4 +84,29 @@ func logging(next http.Handler) http.Handler {
 
 func (r *router) handleHealth(w http.ResponseWriter, req *http.Request) {
 	respondWithJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (r *router) handleJobLogs(w http.ResponseWriter, req *http.Request) {
+	id := req.PathValue("id")
+	if id == "" {
+		respondWithError(w, http.StatusBadRequest, "job id required")
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, req, nil)
+	if err != nil {
+		slog.Error("failed to upgrade connection", "error", err)
+		return
+	}
+
+	r.streamer.Subscribe(id, conn)
+	defer r.streamer.Unsubscribe(id, conn)
+
+	// Keep the connection open
+	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			conn.Close()
+			break
+		}
+	}
 }

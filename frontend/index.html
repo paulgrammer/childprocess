@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Log Stream</title>
+</head>
+<body>
+    <h1>Log Stream</h1>
+    <form id="form">
+        <input type="text" id="command" placeholder="Command" value="ping" />
+        <input type="text" id="args" placeholder="Args" value="-c 10 8.8.8.8" />
+        <button type="submit">Run</button>
+    </form>
+    <pre id="log"></pre>
+
+    <script>
+        const form = document.getElementById('form');
+        const command = document.getElementById('command');
+        const args = document.getElementById('args');
+        const log = document.getElementById('log');
+
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            log.textContent = '';
+            const cmd = command.value;
+            const argArray = args.value.split(' ');
+            const body = {
+                command: cmd,
+                args: argArray,
+            };
+
+            fetch('/jobs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
+            })
+            .then(response => response.json())
+            .then(data => {
+                const jobId = data.job_id;
+                const ws = new WebSocket(`ws://${location.host}/jobs/${jobId}/logs`);
+
+                ws.onmessage = (event) => {
+                    log.textContent += event.data;
+                };
+            });
+        });
+    </script>
+</body>
+</html>

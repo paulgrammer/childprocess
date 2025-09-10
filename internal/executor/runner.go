@@ -27,7 +27,7 @@ type ExecutionResult struct {
 }
 
 type Runner interface {
-	Run(ctx context.Context, jobID string, command string, args []string, workingDir string) (*ExecutionResult, error)
+	Run(ctx context.Context, jobID string, command string, args []string, workingDir string, stdout, stderr io.Writer) (*ExecutionResult, error)
 }
 
 // ExecutorConfig allows customization of execution behavior
@@ -70,7 +70,7 @@ type execRunner struct {
 	config *ExecutorConfig
 }
 
-func (er *execRunner) Run(ctx context.Context, jobID string, command string, args []string, workingDir string) (*ExecutionResult, error) {
+func (er *execRunner) Run(ctx context.Context, jobID string, command string, args []string, workingDir string, stdout, stderr io.Writer) (*ExecutionResult, error) {
 	if err := er.validateInput(command, jobID); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
@@ -106,68 +106,27 @@ func (er *execRunner) Run(ctx context.Context, jobID string, command string, arg
 	// Always capture output for visibility
 	if er.config.CaptureOutput {
 		if er.config.StreamOutput {
-			return er.runWithStreamedOutput(cmd, result)
+			return er.runWithStreamedOutput(cmd, result, stdout, stderr)
 		}
-		return er.runWithCapturedOutput(cmd, result)
+		return er.runWithCapturedOutput(cmd, result, stdout, stderr)
 	}
 
 	// Even for simple execution, we should capture some output
 	return er.runSimpleWithOutput(cmd, result)
 }
 
-func (er *execRunner) runWithCapturedOutput(cmd *exec.Cmd, result *ExecutionResult) (*ExecutionResult, error) {
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
+func (er *execRunner) runWithCapturedOutput(cmd *exec.Cmd, result *ExecutionResult, stdout, stderr io.Writer) (*ExecutionResult, error) {
+	var stdoutBuilder, stderrBuilder strings.Builder
+	cmd.Stdout = io.MultiWriter(&stdoutBuilder, stdout)
+	cmd.Stderr = io.MultiWriter(&stderrBuilder, stderr)
 
 	if err := cmd.Start(); err != nil {
 		result.Error = fmt.Errorf("failed to start command: %w", err)
 		return result, result.Error
 	}
 
-	// Use goroutines to read both pipes concurrently
-	var wg sync.WaitGroup
-	var stdoutErr, stderrErr error
-
-	wg.Add(2)
-
-	// Read stdout
-	go func() {
-		defer wg.Done()
-		stdoutBytes, err := er.readWithLimit(stdoutPipe)
-		if err != nil {
-			stdoutErr = fmt.Errorf("error reading stdout: %w", err)
-			if er.config.VerboseLogging {
-				slog.Warn("Error reading stdout", "job_id", result.JobID, "error", err)
-			}
-		}
-		result.Stdout = string(stdoutBytes)
-	}()
-
-	// Read stderr
-	go func() {
-		defer wg.Done()
-		stderrBytes, err := er.readWithLimit(stderrPipe)
-		if err != nil {
-			stderrErr = fmt.Errorf("error reading stderr: %w", err)
-			if er.config.VerboseLogging {
-				slog.Warn("Error reading stderr", "job_id", result.JobID, "error", err)
-			}
-		}
-		result.Stderr = string(stderrBytes)
-	}()
-
-	// Wait for both readers to complete
-	wg.Wait()
-
 	// Wait for command completion
-	err = cmd.Wait()
+	err := cmd.Wait()
 	result.EndTime = time.Now()
 	result.Duration = result.EndTime.Sub(result.StartTime)
 
@@ -182,25 +141,11 @@ func (er *execRunner) runWithCapturedOutput(cmd *exec.Cmd, result *ExecutionResu
 		result.ExitCode = 0
 	}
 
-	// Report any pipe reading errors
-	if stdoutErr != nil || stderrErr != nil {
-		pipeErrors := []string{}
-		if stdoutErr != nil {
-			pipeErrors = append(pipeErrors, stdoutErr.Error())
-		}
-		if stderrErr != nil {
-			pipeErrors = append(pipeErrors, stderrErr.Error())
-		}
-		slog.Warn("Pipe reading errors occurred",
-			"job_id", result.JobID,
-			"errors", strings.Join(pipeErrors, "; "))
-	}
-
 	er.logExecutionResult(result)
 	return result, result.Error
 }
 
-func (er *execRunner) runWithStreamedOutput(cmd *exec.Cmd, result *ExecutionResult) (*ExecutionResult, error) {
+func (er *execRunner) runWithStreamedOutput(cmd *exec.Cmd, result *ExecutionResult, stdout, stderr io.Writer) (*ExecutionResult, error) {
 	var stdoutBuilder, stderrBuilder strings.Builder
 	var wg sync.WaitGroup
 
@@ -225,13 +170,13 @@ func (er *execRunner) runWithStreamedOutput(cmd *exec.Cmd, result *ExecutionResu
 	// Stream stdout
 	go func() {
 		defer wg.Done()
-		er.streamAndCapture(stdoutPipe, &stdoutBuilder, result.JobID, "stdout")
+		er.streamAndCapture(stdoutPipe, &stdoutBuilder, result.JobID, "stdout", stdout)
 	}()
 
 	// Stream stderr
 	go func() {
 		defer wg.Done()
-		er.streamAndCapture(stderrPipe, &stderrBuilder, result.JobID, "stderr")
+		er.streamAndCapture(stderrPipe, &stderrBuilder, result.JobID, "stderr", stderr)
 	}()
 
 	// Wait for streaming to complete
@@ -287,27 +232,25 @@ func (er *execRunner) runSimpleWithOutput(cmd *exec.Cmd, result *ExecutionResult
 	return result, result.Error
 }
 
-func (er *execRunner) streamAndCapture(reader io.Reader, builder *strings.Builder, jobID, streamType string) {
+func (er *execRunner) streamAndCapture(reader io.Reader, builder *strings.Builder, jobID, streamType string, writer io.Writer) {
 	scanner := bufio.NewScanner(reader)
 	maxScanTokenSize := 64 * 1024 // 64KB buffer for long lines
 	buf := make([]byte, maxScanTokenSize)
 	scanner.Buffer(buf, maxScanTokenSize)
 
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := scanner.Bytes()
 
 		// Write to builder for capture
 		if er.config.MaxOutputSize <= 0 || builder.Len() < er.config.MaxOutputSize {
-			builder.WriteString(line)
+			builder.Write(line)
 			builder.WriteString("\n")
 		}
 
 		// Stream output in real-time
-		slog.Info("Command output",
-			"job_id", jobID,
-			"stream", streamType,
-			"line", line,
-		)
+		if writer != nil {
+			writer.Write(append(line, '\n'))
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -317,21 +260,6 @@ func (er *execRunner) streamAndCapture(reader io.Reader, builder *strings.Builde
 			"error", err,
 		)
 	}
-}
-
-func (er *execRunner) readWithLimit(reader io.Reader) ([]byte, error) {
-	if er.config.MaxOutputSize <= 0 {
-		// No limit - read all efficiently
-		return io.ReadAll(reader)
-	}
-
-	// Read with size limit
-	limitedReader := &io.LimitedReader{
-		R: reader,
-		N: int64(er.config.MaxOutputSize),
-	}
-
-	return io.ReadAll(limitedReader)
 }
 
 func (er *execRunner) validateInput(command, jobID string) error {

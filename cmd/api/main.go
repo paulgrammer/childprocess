@@ -31,15 +31,16 @@ func main() {
 	// Core components
 	store := jobs.NewInMemoryStore()
 	sender := webhook.NewHTTPSender(time.Duration(webhookTimeoutSec)*time.Second, maxWebhookRetries)
+	streamer := jobs.NewLogStreamer()
 	runner := executor.NewExecRunner()
-	manager, err := jobs.NewManager(poolSize, store, sender, runner)
+	manager, err := jobs.NewManager(poolSize, store, sender, runner, streamer)
 	if err != nil {
 		slog.Error("failed to initialize manager", "error", err)
 		os.Exit(1)
 	}
 	defer manager.Stop()
 
-	mux := httpapi.NewRouter(manager)
+	mux := httpapi.NewRouter(manager, streamer)
 
 	srv := &http.Server{
 		Addr:              addr,

@@ -21,9 +21,10 @@ type Manager struct {
 	store       Store
 	sender      webhook.Sender
 	runner      executor.Runner
+	streamer    *LogStreamer
 }
 
-func NewManager(poolSize int, store Store, sender webhook.Sender, runner executor.Runner) (*Manager, error) {
+func NewManager(poolSize int, store Store, sender webhook.Sender, runner executor.Runner, streamer *LogStreamer) (*Manager, error) {
 	if poolSize <= 0 {
 		return nil, errors.New("pool size must be > 0")
 	}
@@ -34,6 +35,7 @@ func NewManager(poolSize int, store Store, sender webhook.Sender, runner executo
 		store:       store,
 		sender:      sender,
 		runner:      runner,
+		streamer:    streamer,
 	}
 	for i := 0; i < m.concurrency; i++ {
 		m.wg.Add(1)
@@ -104,7 +106,14 @@ func (m *Manager) execute(id string) {
 	m.notify(ctx, *job)
 	JobsInProgress.Inc()
 
-	result, err := m.runner.Run(ctx, job.ID, job.Command, job.Args, job.WorkingDir)
+	// Streamer
+	m.streamer.Broadcast(job.ID, []byte("Job started...\n"))
+	defer m.streamer.Close(job.ID)
+
+	// Create a writer that broadcasts to the streamer
+	writer := &logStreamWriter{streamer: m.streamer, jobID: job.ID}
+
+	result, err := m.runner.Run(ctx, job.ID, job.Command, job.Args, job.WorkingDir, writer, writer)
 	if err != nil {
 		job.Status = JobStatusFailed
 		job.Error = err.Error()
@@ -112,6 +121,7 @@ func (m *Manager) execute(id string) {
 		m.notify(ctx, *job)
 		JobsInProgress.Dec()
 		JobsFailedTotal.Inc()
+		m.streamer.Broadcast(job.ID, []byte("Job failed: "+err.Error()+"\n"))
 		return
 	}
 
@@ -150,4 +160,14 @@ func (m *Manager) notify(ctx context.Context, job Job) {
 		Timestamp: time.Now().UTC(),
 		Metadata:  job.Metadata,
 	})
+}
+
+type logStreamWriter struct {
+	streamer *LogStreamer
+	jobID    string
+}
+
+func (l *logStreamWriter) Write(p []byte) (n int, err error) {
+	l.streamer.Broadcast(l.jobID, p)
+	return len(p), nil
 }
